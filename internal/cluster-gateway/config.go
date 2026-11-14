@@ -65,6 +65,10 @@ type Config struct {
 	// ShutdownTimeout. Zero disables the choreographed drain (connections are
 	// closed immediately).
 	DrainWindow time.Duration
+	// CASecretTTL is how long a client CA read from a plane CR's SecretKeyRef
+	// is served from cache before a background refresh. Zero uses the default
+	// (5m). A CR create/update notification always re-reads its CA at once.
+	CASecretTTL time.Duration
 }
 
 // RemoteServerClientConfig holds configuration for RemoteServerClient

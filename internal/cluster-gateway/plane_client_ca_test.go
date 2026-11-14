@@ -858,7 +858,7 @@ func TestExtractPlaneClientCAs(t *testing.T) {
 
 	ctx := context.Background()
 	result, err := server.extractPlaneClientCAs(ctx, planeTypeDataPlane, "target-plane",
-		&openchoreov1alpha1.DataPlaneList{}, dataPlaneInfo)
+		&openchoreov1alpha1.DataPlaneList{}, dataPlaneInfo, "")
 
 	require.NoError(t, err)
 	assert.Len(t, result, 1)
@@ -979,7 +979,7 @@ func TestExtractCAFromPlane_NilAgent(t *testing.T) {
 		logger:    testLogger(),
 	}
 
-	data, err := server.extractCAFromPlane(nil, "test-ns")
+	data, err := server.extractCAFromPlane(context.Background(), nil, "test-ns", false)
 	assert.NoError(t, err)
 	assert.Nil(t, data)
 }
@@ -996,7 +996,7 @@ func TestExtractCADataWithNamespace_NoValueNoSecret(t *testing.T) {
 		// Neither Value nor SecretKeyRef set
 	}
 
-	_, err := server.extractCADataWithNamespace(valueFrom, "test-ns")
+	_, err := server.extractCADataWithNamespace(context.Background(), valueFrom, "test-ns", false)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "no valid CA data found")
 }
@@ -1109,7 +1109,7 @@ func TestExtractPlaneClientCAs_CAExtractionError(t *testing.T) {
 
 	ctx := context.Background()
 	result, err := server.extractPlaneClientCAs(ctx, planeTypeDataPlane, "target-plane",
-		&openchoreov1alpha1.DataPlaneList{}, dataPlaneInfo)
+		&openchoreov1alpha1.DataPlaneList{}, dataPlaneInfo, "")
 
 	// Should not error — just skips the bad CR
 	require.NoError(t, err)
@@ -1155,7 +1155,7 @@ func TestExtractPlaneClientCAs_MixedGoodAndBadCRs(t *testing.T) {
 
 	ctx := context.Background()
 	result, err := server.extractPlaneClientCAs(ctx, planeTypeDataPlane, "shared",
-		&openchoreov1alpha1.DataPlaneList{}, dataPlaneInfo)
+		&openchoreov1alpha1.DataPlaneList{}, dataPlaneInfo, "")
 
 	require.NoError(t, err)
 	assert.Len(t, result, 1)

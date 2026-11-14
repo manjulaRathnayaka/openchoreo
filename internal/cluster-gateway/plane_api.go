@@ -29,7 +29,7 @@ type PlaneNotification struct {
 // PlaneNotificationResponse represents the response to a plane notification
 type PlaneNotificationResponse struct {
 	Success               bool   `json:"success"`
-	Action                string `json:"action"` // "disconnect", "disconnect_fallback", "revalidate"
+	Action                string `json:"action"` // "revoke", "revalidate"
 	DisconnectedAgents    *int   `json:"disconnectedAgents,omitempty"`
 	AuthorizationsGranted *int   `json:"authorizationsGranted,omitempty"`
 	AuthorizationsRevoked *int   `json:"authorizationsRevoked,omitempty"`
@@ -133,13 +133,18 @@ func (api *PlaneAPI) handlePlaneNotification(w http.ResponseWriter, r *http.Requ
 		}
 
 	case "deleted":
-		disconnectedCount := api.connMgr.DisconnectAllForPlane(notification.PlaneType, notification.PlaneID)
-		api.logger.Info("disconnected agents for CR deletion",
+		revoked, closed, disconnected := api.server.revokeDeletedCR(
+			notification.PlaneType, notification.PlaneID, notification.Namespace, notification.Name)
+		disconnectedCount := closed + disconnected
+		api.logger.Info("revoked CR authorization for CR deletion",
 			"planeType", notification.PlaneType,
 			"planeID", notification.PlaneID,
+			"cr", fmt.Sprintf("%s/%s", notification.Namespace, notification.Name),
+			"authorizationsRevoked", revoked,
 			"disconnectedAgents", disconnectedCount,
 		)
-		result.Action = "disconnect"
+		result.Action = "revoke"
+		result.AuthorizationsRevoked = &revoked
 		result.DisconnectedAgents = &disconnectedCount
 
 	default:

@@ -69,9 +69,43 @@ func TestHandlePlaneNotification_Deleted(t *testing.T) {
 	var resp PlaneNotificationResponse
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	assert.True(t, resp.Success)
-	assert.Equal(t, "disconnect", resp.Action)
+	// The connection's only CR was deleted, so it is closed.
+	assert.Equal(t, "revoke", resp.Action)
 	require.NotNil(t, resp.DisconnectedAgents)
 	assert.Equal(t, 1, *resp.DisconnectedAgents)
+}
+
+// Deleting one of several CRs that share a planeID (one tenant on a shared
+// physical plane) must not disconnect the agent serving the other tenants.
+func TestHandlePlaneNotification_DeletedSharedPlaneKeepsConnection(t *testing.T) {
+	mux, cm := newTestPlaneAPI(t)
+
+	conn, cleanup := newTestWSConn(t)
+	defer cleanup()
+	_, err := cm.Register("dataplane", "shared", conn, []string{"org-a/default", "org-b/default"}, nil, nil)
+	require.NoError(t, err)
+
+	body, _ := json.Marshal(PlaneNotification{
+		PlaneType: "dataplane", PlaneID: "shared", Event: "deleted", Namespace: "org-a", Name: "default",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/planes/notify", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var resp PlaneNotificationResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, "revoke", resp.Action)
+	require.NotNil(t, resp.AuthorizationsRevoked)
+	assert.Equal(t, 1, *resp.AuthorizationsRevoked)
+	require.NotNil(t, resp.DisconnectedAgents)
+	assert.Equal(t, 0, *resp.DisconnectedAgents)
+
+	assert.Equal(t, 1, cm.Count(), "connection must stay up for the remaining tenant")
+	_, err = cm.GetForCR("dataplane/shared", "org-b/default")
+	assert.NoError(t, err)
+	_, err = cm.GetForCR("dataplane/shared", "org-a/default")
+	assert.Error(t, err, "deleted CR must no longer be routable")
 }
 
 func TestHandlePlaneNotification_Created(t *testing.T) {

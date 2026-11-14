@@ -1,0 +1,25 @@
+# In-cluster curl pod for measure.sh: calls the cluster-gateway internal API
+# (port 8444) with the controller-manager's client certificate, like the
+# controller does.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: probe
+  namespace: openchoreo-control-plane
+spec:
+  containers:
+  - name: curl
+    image: curlimages/curl:8.11.1
+    command: ["sleep", "infinity"]
+    volumeMounts:
+    - {name: c, mountPath: /c, readOnly: true}
+  volumes:
+  - name: c
+    projected:
+      sources:
+      - secret:
+          name: controller-manager-cluster-gateway-client-tls
+          items: [{key: tls.crt, path: tls.crt}, {key: tls.key, path: tls.key}]
+      - secret:
+          name: cluster-gateway-tls
+          items: [{key: ca.crt, path: ca.crt}]
