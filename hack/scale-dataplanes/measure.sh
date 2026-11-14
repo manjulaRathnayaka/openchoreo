@@ -83,12 +83,14 @@ scenario_newauth() {
 # delete: probe an unrelated org continuously while one org is deleted.
 scenario_delete() {
   local org since out
-  org=$(printf "${ORG_PREFIX:-org}-%04d" "$NEW_IDX")
-  WAIT_NS=true "$HERE/orgs.sh" delete "$NEW_IDX" "$NEW_IDX" >/dev/null 2>&1 || true
-  "$HERE/orgs.sh" create "$NEW_IDX" "$NEW_IDX" >/dev/null
+  # Use a fresh org (not NEW_IDX): waiting for a namespace to finish
+  # terminating can take many minutes on a large k3d cluster.
+  local idx=$(( NEW_IDX + 50 + RANDOM % 900 ))
+  org=$(printf "${ORG_PREFIX:-org}-%04d" "$idx")
+  "$HERE/orgs.sh" create "$idx" "$idx" >/dev/null
   sleep 5
   since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  ( sleep 3; "$HERE/orgs.sh" delete "$NEW_IDX" "$NEW_IDX" >/dev/null ) &
+  ( sleep 3; "$HERE/orgs.sh" delete "$idx" "$idx" >/dev/null ) &
   out=$(inpod "end=\$((\$(date +%s)+${DELETE_WINDOW:-45})); while [ \$(date +%s) -lt \$end ]; do $CURL -o /dev/null -w '%{http_code}\n' $G$(proxy_path ${ORG_PREFIX:-org}-0001); sleep 0.25; done")
   wait
   local total bad

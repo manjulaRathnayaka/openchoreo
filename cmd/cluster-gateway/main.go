@@ -130,8 +130,10 @@ func main() {
 		"Period over which GOAWAY frames are spread across agent connections during shutdown")
 	flag.DurationVar(&caSecretTTL, "ca-secret-ttl", cmdutil.GetEnvDuration("CA_SECRET_TTL", 5*time.Minute),
 		"How long a plane client CA read from a Secret is served from cache before a background refresh")
-	flag.IntVar(&k8sQPS, "kube-api-qps", cmdutil.GetEnvInt("KUBE_API_QPS", 50), "Client-side QPS limit for Kubernetes API calls")
-	flag.IntVar(&k8sBurst, "kube-api-burst", cmdutil.GetEnvInt("KUBE_API_BURST", 100), "Client-side burst limit for Kubernetes API calls")
+	flag.IntVar(&k8sQPS, "kube-api-qps", cmdutil.GetEnvInt("KUBE_API_QPS", 0),
+		"Client-side QPS limit for Kubernetes API calls (0 keeps the controller-runtime default: disabled, relying on API priority and fairness)")
+	flag.IntVar(&k8sBurst, "kube-api-burst", cmdutil.GetEnvInt("KUBE_API_BURST", 0),
+		"Client-side burst limit for Kubernetes API calls (used only with --kube-api-qps)")
 	flag.StringVar(&logLevel, "log-level", cmdutil.GetEnv("LOG_LEVEL", "info"), "Log level (debug, info, warn, error)")
 	flag.Parse()
 
@@ -164,8 +166,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	k8sConfig.QPS = float32(k8sQPS)
-	k8sConfig.Burst = k8sBurst
+	if k8sQPS > 0 {
+		k8sConfig.QPS = float32(k8sQPS)
+		k8sConfig.Burst = max(k8sBurst, k8sQPS)
+	}
 
 	// Plane CRs are served from an informer cache: every agent connect lists
 	// all plane CRs sharing its planeID, and with many tenant CRs per physical

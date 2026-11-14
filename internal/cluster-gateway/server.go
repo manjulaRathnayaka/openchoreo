@@ -1177,6 +1177,13 @@ func (s *Server) SendHTTPTunnelRequestForCR(
 		} else if s.fabricMesh != nil {
 			s.logger.Debug("mesh forward failed", "plane", planeName, "cr", crKey, "error", fwdErr)
 		}
+		// The plane's agents may all be connected to peer replicas. If any
+		// are, the plane is up and the failure is authorization for this CR,
+		// so report it the same way the owning replica would (403), not as
+		// a missing plane (502).
+		if s.fabricRegistry != nil && s.fabricRegistry.CountForPlane(planeName) > 0 {
+			return nil, "", fmt.Errorf("no agents authorized for CR %s", crKey)
+		}
 		return nil, "", err
 	}
 
