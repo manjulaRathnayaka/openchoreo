@@ -137,13 +137,19 @@ func clusterObsPlaneInfo(obj client.Object) (planeInfo, bool) {
 }
 
 // extractPlaneClientCAs is a generic helper that extracts client CAs from a list of plane CRs
-// It eliminates code duplication across DataPlane, WorkflowPlane, and ObservabilityPlane processing
+// It eliminates code duplication across DataPlane, WorkflowPlane, and ObservabilityPlane processing.
+//
+// onlyCR, when set ("namespace/name"), limits the result to that one CR, and
+// its CA is read fresh (bypassing the CA cache) - used for create/update
+// notifications so a rotated CA takes effect at once without re-reading the
+// CA of every other CR sharing the planeID.
 func (s *Server) extractPlaneClientCAs(
 	ctx context.Context,
 	planeType string,
 	planeID string,
 	list client.ObjectList,
 	extractInfo func(client.Object) (planeInfo, bool),
+	onlyCR string,
 ) (map[string][]byte, error) {
 	result := make(map[string][]byte)
 
@@ -158,18 +164,35 @@ func (s *Server) extractPlaneClientCAs(
 		return nil, fmt.Errorf("failed to extract items from list: %w", err)
 	}
 
+	matched := make([]planeInfo, 0)
+	secretKeys := make([]secretCAKey, 0)
 	for _, item := range items {
 		info, ok := extractInfo(item)
 		if !ok {
 			continue // Skip items that can't be extracted (shouldn't happen)
 		}
-
 		if info.planeID != planeID {
 			continue
 		}
+		if onlyCR != "" && fmt.Sprintf("%s/%s", info.namespace, info.name) != onlyCR {
+			continue
+		}
+		matched = append(matched, info)
+		if k, ok := secretKeyForPlane(info); ok {
+			secretKeys = append(secretKeys, k)
+		}
+	}
 
+	// Load every missing CA secret in one bounded-parallel round instead of
+	// one serial read per CR.
+	force := onlyCR != ""
+	if !force && s.caCache != nil {
+		s.caCache.ensure(ctx, secretKeys)
+	}
+
+	for _, info := range matched {
 		crKey := fmt.Sprintf("%s/%s", info.namespace, info.name)
-		caData, err := s.extractCAFromPlane(info.agent, info.namespace)
+		caData, err := s.extractCAFromPlane(ctx, info.agent, info.namespace, force)
 		if err != nil {
 			s.logger.Warn("failed to extract CA from plane CR",
 				"planeType", planeType,
@@ -184,6 +207,23 @@ func (s *Server) extractPlaneClientCAs(
 	}
 
 	return result, nil
+}
+
+// secretKeyForPlane returns the Secret key a plane CR's client CA is read from,
+// if it is configured by SecretKeyRef.
+func secretKeyForPlane(info planeInfo) (secretCAKey, bool) {
+	if info.agent == nil || info.agent.ClientCA.Value != "" || info.agent.ClientCA.SecretKeyRef == nil {
+		return secretCAKey{}, false
+	}
+	ref := info.agent.ClientCA.SecretKeyRef
+	if ref.Name == "" || ref.Key == "" {
+		return secretCAKey{}, false
+	}
+	ns := ref.Namespace
+	if ns == "" {
+		ns = info.namespace
+	}
+	return secretCAKey{Namespace: ns, Name: ref.Name, Key: ref.Key}, true
 }
 
 // extractListItems extracts the Items slice from a client.ObjectList
@@ -236,6 +276,12 @@ func extractListItems(list client.ObjectList) ([]client.Object, error) {
 // For namespace-scoped CRs, key format is "namespace/name"
 // For cluster-scoped CRs, key format is "/name" (empty namespace)
 func (s *Server) getAllPlaneClientCAs(planeType, planeID string) (map[string][]byte, error) {
+	return s.getPlaneClientCAs(planeType, planeID, "")
+}
+
+// getPlaneClientCAs is getAllPlaneClientCAs, optionally limited to one CR
+// ("namespace/name") whose CA is then read fresh. See extractPlaneClientCAs.
+func (s *Server) getPlaneClientCAs(planeType, planeID, onlyCR string) (map[string][]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -246,7 +292,7 @@ func (s *Server) getAllPlaneClientCAs(planeType, planeID string) (map[string][]b
 	case planeTypeDataPlane:
 		// Namespace-scoped DataPlane
 		nsResult, err := s.extractPlaneClientCAs(ctx, planeType, planeID,
-			&openchoreov1alpha1.DataPlaneList{}, dataPlaneInfo)
+			&openchoreov1alpha1.DataPlaneList{}, dataPlaneInfo, onlyCR)
 		if err != nil {
 			return nil, err
 		}
@@ -255,7 +301,7 @@ func (s *Server) getAllPlaneClientCAs(planeType, planeID string) (map[string][]b
 		}
 		// Cluster-scoped ClusterDataPlane
 		clusterResult, err := s.extractPlaneClientCAs(ctx, planeType, planeID,
-			&openchoreov1alpha1.ClusterDataPlaneList{}, clusterDataPlaneInfo)
+			&openchoreov1alpha1.ClusterDataPlaneList{}, clusterDataPlaneInfo, onlyCR)
 		if err != nil {
 			return nil, err
 		}
@@ -266,7 +312,7 @@ func (s *Server) getAllPlaneClientCAs(planeType, planeID string) (map[string][]b
 	case planeTypeWorkflowPlane:
 		// Namespace-scoped WorkflowPlane
 		nsResult, err := s.extractPlaneClientCAs(ctx, planeType, planeID,
-			&openchoreov1alpha1.WorkflowPlaneList{}, workflowPlaneInfo)
+			&openchoreov1alpha1.WorkflowPlaneList{}, workflowPlaneInfo, onlyCR)
 		if err != nil {
 			return nil, err
 		}
@@ -275,7 +321,7 @@ func (s *Server) getAllPlaneClientCAs(planeType, planeID string) (map[string][]b
 		}
 		// Cluster-scoped ClusterWorkflowPlane
 		clusterResult, err := s.extractPlaneClientCAs(ctx, planeType, planeID,
-			&openchoreov1alpha1.ClusterWorkflowPlaneList{}, clusterWorkflowPlaneInfo)
+			&openchoreov1alpha1.ClusterWorkflowPlaneList{}, clusterWorkflowPlaneInfo, onlyCR)
 		if err != nil {
 			return nil, err
 		}
@@ -286,7 +332,7 @@ func (s *Server) getAllPlaneClientCAs(planeType, planeID string) (map[string][]b
 	case planeTypeObservabilityPlane:
 		// Namespace-scoped ObservabilityPlane
 		nsResult, err := s.extractPlaneClientCAs(ctx, planeType, planeID,
-			&openchoreov1alpha1.ObservabilityPlaneList{}, obsPlaneInfo)
+			&openchoreov1alpha1.ObservabilityPlaneList{}, obsPlaneInfo, onlyCR)
 		if err != nil {
 			return nil, err
 		}
@@ -295,7 +341,7 @@ func (s *Server) getAllPlaneClientCAs(planeType, planeID string) (map[string][]b
 		}
 		// Cluster-scoped ClusterObservabilityPlane
 		clusterResult, err := s.extractPlaneClientCAs(ctx, planeType, planeID,
-			&openchoreov1alpha1.ClusterObservabilityPlaneList{}, clusterObsPlaneInfo)
+			&openchoreov1alpha1.ClusterObservabilityPlaneList{}, clusterObsPlaneInfo, onlyCR)
 		if err != nil {
 			return nil, err
 		}
@@ -307,7 +353,7 @@ func (s *Server) getAllPlaneClientCAs(planeType, planeID string) (map[string][]b
 		return nil, fmt.Errorf("unsupported plane type: %s", planeType)
 	}
 
-	s.logger.Info("retrieved client CAs from CRs",
+	s.logger.Debug("retrieved client CAs from CRs",
 		"planeType", planeType,
 		"planeID", planeID,
 		"totalCRs", len(result),
@@ -315,7 +361,7 @@ func (s *Server) getAllPlaneClientCAs(planeType, planeID string) (map[string][]b
 
 	if len(result) > 0 {
 		for crKey := range result {
-			s.logger.Info("discovered CR for plane",
+			s.logger.Debug("discovered CR for plane",
 				"planeType", planeType,
 				"planeID", planeID,
 				"cr", crKey,
@@ -333,21 +379,32 @@ func (s *Server) getAllPlaneClientCAs(planeType, planeID string) (map[string][]b
 }
 
 // extractCAFromPlane extracts CA data from a plane's ClusterAgent configuration
-func (s *Server) extractCAFromPlane(clusterAgent *openchoreov1alpha1.ClusterAgentConfig, namespace string) ([]byte, error) {
+func (s *Server) extractCAFromPlane(
+	ctx context.Context, clusterAgent *openchoreov1alpha1.ClusterAgentConfig, namespace string, force bool,
+) ([]byte, error) {
 	if clusterAgent == nil {
 		return nil, nil
 	}
-	return s.extractCADataWithNamespace(&clusterAgent.ClientCA, namespace)
+	return s.extractCADataWithNamespace(ctx, &clusterAgent.ClientCA, namespace, force)
 }
 
 // extractCAData extracts CA certificate data from ValueFrom configuration
 // planeNamespace is used as default namespace for SecretRef if not specified
-func (s *Server) extractCADataWithNamespace(valueFrom *openchoreov1alpha1.ValueFrom, planeNamespace string) ([]byte, error) {
+func (s *Server) extractCADataWithNamespace(
+	ctx context.Context, valueFrom *openchoreov1alpha1.ValueFrom, planeNamespace string, force bool,
+) ([]byte, error) {
 	if valueFrom.Value != "" {
 		return []byte(valueFrom.Value), nil
 	}
 
 	if valueFrom.SecretKeyRef != nil {
+		if s.caCache != nil && valueFrom.SecretKeyRef.Name != "" && valueFrom.SecretKeyRef.Key != "" {
+			ns := valueFrom.SecretKeyRef.Namespace
+			if ns == "" {
+				ns = planeNamespace
+			}
+			return s.caCache.get(ctx, secretCAKey{Namespace: ns, Name: valueFrom.SecretKeyRef.Name, Key: valueFrom.SecretKeyRef.Key}, force)
+		}
 		return s.extractCAFromSecret(valueFrom.SecretKeyRef, planeNamespace)
 	}
 

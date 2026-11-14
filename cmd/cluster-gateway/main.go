@@ -4,16 +4,19 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	openchoreov1alpha1 "github.com/openchoreo/openchoreo/api/v1alpha1"
@@ -67,6 +70,9 @@ func main() {
 		meshCACertPath           string
 		meshServiceName          string
 		drainWindow              time.Duration
+		caSecretTTL              time.Duration
+		k8sQPS                   int
+		k8sBurst                 int
 	)
 
 	flag.IntVar(&port, "port", cmdutil.GetEnvInt("AGENT_SERVER_PORT", defaultPort),
@@ -122,6 +128,12 @@ func main() {
 	flag.DurationVar(&drainWindow, "drain-window",
 		cmdutil.GetEnvDuration("DRAIN_WINDOW", defaultDrainWindow),
 		"Period over which GOAWAY frames are spread across agent connections during shutdown")
+	flag.DurationVar(&caSecretTTL, "ca-secret-ttl", cmdutil.GetEnvDuration("CA_SECRET_TTL", 5*time.Minute),
+		"How long a plane client CA read from a Secret is served from cache before a background refresh")
+	flag.IntVar(&k8sQPS, "kube-api-qps", cmdutil.GetEnvInt("KUBE_API_QPS", 0),
+		"Client-side QPS limit for Kubernetes API calls (0 keeps the controller-runtime default: disabled, relying on API priority and fairness)")
+	flag.IntVar(&k8sBurst, "kube-api-burst", cmdutil.GetEnvInt("KUBE_API_BURST", 0),
+		"Client-side burst limit for Kubernetes API calls (used only with --kube-api-qps)")
 	flag.StringVar(&logLevel, "log-level", cmdutil.GetEnv("LOG_LEVEL", "info"), "Log level (debug, info, warn, error)")
 	flag.Parse()
 
@@ -154,11 +166,56 @@ func main() {
 		os.Exit(1)
 	}
 
-	k8sClient, err := client.New(k8sConfig, client.Options{Scheme: scheme})
+	if k8sQPS > 0 {
+		k8sConfig.QPS = float32(k8sQPS)
+		k8sConfig.Burst = max(k8sBurst, k8sQPS)
+	}
+
+	// Plane CRs are served from an informer cache: every agent connect lists
+	// all plane CRs sharing its planeID, and with many tenant CRs per physical
+	// plane a live List per connect is too slow. Secrets are never cached
+	// (the gateway only reads the CA secrets plane CRs reference, by name, and
+	// keeps those in its own small CA cache).
+	planeCache, err := cache.New(k8sConfig, cache.Options{Scheme: scheme})
+	if err != nil {
+		logger.Error("failed to create plane CR cache", "error", err)
+		os.Exit(1)
+	}
+	k8sClient, err := client.New(k8sConfig, client.Options{
+		Scheme: scheme,
+		Cache: &client.CacheOptions{
+			Reader:     planeCache,
+			DisableFor: []client.Object{&corev1.Secret{}},
+		},
+	})
 	if err != nil {
 		logger.Error("failed to create Kubernetes client", "error", err)
 		os.Exit(1)
 	}
+	cacheCtx := context.Background()
+	for _, obj := range []client.Object{
+		&openchoreov1alpha1.DataPlane{}, &openchoreov1alpha1.ClusterDataPlane{},
+		&openchoreov1alpha1.WorkflowPlane{}, &openchoreov1alpha1.ClusterWorkflowPlane{},
+		&openchoreov1alpha1.ObservabilityPlane{}, &openchoreov1alpha1.ClusterObservabilityPlane{},
+	} {
+		if _, err := planeCache.GetInformer(cacheCtx, obj); err != nil {
+			logger.Error("failed to create plane CR informer", "type", fmt.Sprintf("%T", obj), "error", err)
+			os.Exit(1)
+		}
+	}
+	go func() {
+		if err := planeCache.Start(cacheCtx); err != nil {
+			logger.Error("plane CR cache stopped", "error", err)
+			os.Exit(1)
+		}
+	}()
+	syncCtx, syncCancel := context.WithTimeout(cacheCtx, 2*time.Minute)
+	if !planeCache.WaitForCacheSync(syncCtx) {
+		syncCancel()
+		logger.Error("timed out waiting for plane CR cache to sync")
+		os.Exit(1)
+	}
+	syncCancel()
 
 	logger.Info("Kubernetes client created successfully")
 
@@ -179,9 +236,11 @@ func main() {
 		HeartbeatInterval:        heartbeatInterval,
 		HeartbeatTimeout:         heartbeatTimeout,
 		DrainWindow:              drainWindow,
+		CASecretTTL:              caSecretTTL,
 	}
 
 	srv := clustergateway.New(config, k8sClient, logger)
+	srv.EnablePlaneCAPrewarm()
 
 	// Gateway mesh fabric: replicate the connection registry across replicas
 	// and forward requests between them, so the gateway can scale horizontally

@@ -28,6 +28,7 @@ import (
 	"github.com/gorilla/websocket"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	openchoreov1alpha1 "github.com/openchoreo/openchoreo/api/v1alpha1"
 	"github.com/openchoreo/openchoreo/internal/cluster-agent/messaging"
 	"github.com/openchoreo/openchoreo/internal/cluster-gateway/fabric"
 )
@@ -86,6 +87,9 @@ type Server struct {
 	logger                *slog.Logger
 	agentAuth             AgentAuthenticator // How the public listener extracts the agent client certificate
 	k8sClient             client.Client      // Kubernetes client for querying DataPlane/WorkflowPlane CRs
+	caCache               *secretCACache     // CA bundles read from plane CR SecretKeyRefs
+	caWarm                atomic.Bool        // CA cache pre-warmed (gates readiness when prewarm is enabled)
+	caPrewarm             bool               // readiness waits for PrewarmCAs to finish
 
 	// Gateway mesh fabric (optional): replicates the connection registry
 	// across gateway replicas and forwards requests to the pod that owns the
@@ -141,10 +145,85 @@ func New(config *Config, k8sClient client.Client, logger *slog.Logger) *Server {
 		validator:             NewRequestValidator(),
 		logger:                logger.With("component", "agent-server"),
 		k8sClient:             k8sClient,
+		caCache:               newSecretCACache(k8sClient, config.CASecretTTL, logger.With("component", "ca-cache")),
 		// Safe default; Start replaces this with the configured mode (and
 		// surfaces an invalid mode as an error).
 		agentAuth: mtlsAuthenticator{},
 	}
+}
+
+// EnablePlaneCAPrewarm makes Start load every plane CR's CA secret into the
+// CA cache in the background, and keeps the pod unready until that finishes.
+// Must be called before Start.
+func (s *Server) EnablePlaneCAPrewarm() {
+	s.caPrewarm = true
+}
+
+// planeListTypes lists every plane CR kind whose client CA the gateway verifies.
+func planeListTypes() []struct {
+	list    func() client.ObjectList
+	extract func(client.Object) (planeInfo, bool)
+} {
+	return []struct {
+		list    func() client.ObjectList
+		extract func(client.Object) (planeInfo, bool)
+	}{
+		{func() client.ObjectList { return &openchoreov1alpha1.DataPlaneList{} }, dataPlaneInfo},
+		{func() client.ObjectList { return &openchoreov1alpha1.ClusterDataPlaneList{} }, clusterDataPlaneInfo},
+		{func() client.ObjectList { return &openchoreov1alpha1.WorkflowPlaneList{} }, workflowPlaneInfo},
+		{func() client.ObjectList { return &openchoreov1alpha1.ClusterWorkflowPlaneList{} }, clusterWorkflowPlaneInfo},
+		{func() client.ObjectList { return &openchoreov1alpha1.ObservabilityPlaneList{} }, obsPlaneInfo},
+		{func() client.ObjectList { return &openchoreov1alpha1.ClusterObservabilityPlaneList{} }, clusterObsPlaneInfo},
+	}
+}
+
+// prewarmPlaneCAs reads the CA secret of every plane CR into the CA cache,
+// then marks the CA cache warm. A failed list is retried a few times; after
+// that the pod goes ready anyway and the cache fills on demand, so a
+// persistent API problem cannot keep the gateway out of service forever.
+func (s *Server) prewarmPlaneCAs(ctx context.Context) {
+	defer s.caWarm.Store(true)
+	start := time.Now()
+	for attempt := 1; attempt <= 5; attempt++ {
+		keys := make([]secretCAKey, 0)
+		var listErr error
+		for _, t := range planeListTypes() {
+			lctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			list := t.list()
+			err := s.k8sClient.List(lctx, list)
+			cancel()
+			if err != nil {
+				listErr = err
+				break
+			}
+			items, err := extractListItems(list)
+			if err != nil {
+				listErr = err
+				break
+			}
+			for _, item := range items {
+				if info, ok := t.extract(item); ok {
+					if k, ok := secretKeyForPlane(info); ok {
+						keys = append(keys, k)
+					}
+				}
+			}
+		}
+		if listErr == nil {
+			s.caCache.ensure(ctx, keys)
+			s.logger.Info("plane CA cache warmed",
+				"secrets", len(keys),
+				"cached", s.caCache.len(),
+				"duration", time.Since(start).Round(time.Millisecond),
+			)
+			return
+		}
+		s.logger.Warn("plane CA prewarm: listing plane CRs failed, retrying", "attempt", attempt, "error", listErr)
+		if !waitOrDone(ctx, 2*time.Second) {
+			return
+		}
+	}
+	s.logger.Warn("plane CA prewarm gave up; CA secrets will be loaded on demand")
 }
 
 func generateRequestID() string {
@@ -289,6 +368,10 @@ func (s *Server) Start() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	if s.caPrewarm {
+		go s.prewarmPlaneCAs(ctx)
+	}
 
 	// The mesh outlives the shutdown signal: draining needs the links to carry
 	// DRAINING, removal deltas, and in-flight forward responses.
@@ -448,6 +531,13 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	// live. A freshly started replica can reach its own health server long
 	// before its first peer snapshots arrive, and routing to it in that window
 	// yields "no agents found" for planes whose agents are connected to peers.
+	// Stay out of Service endpoints until every plane CR's CA secret is cached,
+	// so the first agent connects after a restart do not pay one Secret read
+	// per CR sharing their planeID.
+	if s.caPrewarm && !s.caWarm.Load() {
+		http.Error(w, "CA cache warming", http.StatusServiceUnavailable)
+		return
+	}
 	if s.fabricMesh != nil && !s.fabricMesh.Converged() {
 		http.Error(w, "mesh registry not converged", http.StatusServiceUnavailable)
 		return
@@ -620,7 +710,6 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		"planeID", planeID,
 		"planeIdentifier", planeIdentifier,
 		"connectionID", connID,
-		"validCRs", validCRs,
 		"validCRCount", len(validCRs),
 	)
 
@@ -647,11 +736,20 @@ func (s *Server) handleConnection(planeName, connID string, conn Connection) {
 	pingTicker := time.NewTicker(s.config.HeartbeatInterval)
 	defer pingTicker.Stop()
 
+	// Stopping a ticker does not close its channel, so the pinger needs its own
+	// exit signal or it outlives the connection.
+	pingDone := make(chan struct{})
+	defer close(pingDone)
 	go func() {
-		for range pingTicker.C {
-			if err := conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second)); err != nil {
-				s.logger.Debug("failed to send ping", "plane", planeName, "error", err)
+		for {
+			select {
+			case <-pingDone:
 				return
+			case <-pingTicker.C:
+				if err := conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second)); err != nil {
+					s.logger.Debug("failed to send ping", "plane", planeName, "error", err)
+					return
+				}
 			}
 		}
 	}()
@@ -1079,6 +1177,13 @@ func (s *Server) SendHTTPTunnelRequestForCR(
 		} else if s.fabricMesh != nil {
 			s.logger.Debug("mesh forward failed", "plane", planeName, "cr", crKey, "error", fwdErr)
 		}
+		// The plane's agents may all be connected to peer replicas. If any
+		// are, the plane is up and the failure is authorization for this CR,
+		// so report it the same way the owning replica would (403), not as
+		// a missing plane (502).
+		if s.fabricRegistry != nil && s.fabricRegistry.CountForPlane(planeName) > 0 {
+			return nil, "", fmt.Errorf("no agents authorized for CR %s", crKey)
+		}
 		return nil, "", err
 	}
 
@@ -1226,11 +1331,24 @@ func (s *Server) ApplyPlaneEvent(ev fabric.PlaneEvent) {
 
 	switch ev.Event {
 	case "created", "updated":
-		caData, err := s.fetchCRClientCA(ev.PlaneType, ev.PlaneID, ev.Namespace, ev.Name)
+		// The replica that received the notification already answered the
+		// controller, so nothing upstream retries this one: a failure here
+		// would leave connections owned by this replica unauthorized for the
+		// CR until the agent happens to reconnect. Retry locally instead.
+		var caData []byte
+		var err error
+		for attempt, backoff := 1, time.Second; ; attempt, backoff = attempt+1, backoff*2 {
+			caData, err = s.fetchCRClientCA(ev.PlaneType, ev.PlaneID, ev.Namespace, ev.Name)
+			if err == nil || attempt >= planeEventMaxAttempts {
+				break
+			}
+			time.Sleep(backoff)
+		}
 		if err != nil {
 			s.logger.Warn("failed to fetch CR CA for propagated re-validation",
 				"planeType", ev.PlaneType,
 				"planeID", ev.PlaneID,
+				"attempts", planeEventMaxAttempts,
 				"error", err,
 			)
 			return
@@ -1238,11 +1356,30 @@ func (s *Server) ApplyPlaneEvent(ev fabric.PlaneEvent) {
 		if _, _, err := s.connMgr.RevalidateCR(ev.PlaneType, ev.PlaneID, ev.Namespace, ev.Name, caData); err != nil {
 			s.logger.Warn("propagated CR re-validation failed", "error", err)
 		}
-	case "deleted", "reconnect":
+	case "deleted":
+		s.revokeDeletedCR(ev.PlaneType, ev.PlaneID, ev.Namespace, ev.Name)
+	case "reconnect":
 		s.connMgr.DisconnectAllForPlane(ev.PlaneType, ev.PlaneID)
 	default:
 		s.logger.Warn("unknown propagated plane event", "event", ev.Event)
 	}
+}
+
+// planeEventMaxAttempts bounds retries of a propagated plane event's CA fetch.
+const planeEventMaxAttempts = 5
+
+// revokeDeletedCR withdraws a deleted plane CR's authorization from the
+// plane's agent connections. Many CRs can share one planeID - one per tenant
+// on a shared physical plane - so dropping every connection for the plane
+// would cut off every other tenant to remove one. Connections left with no
+// authorized CR are closed, as before. Without a CR name (an older caller) it
+// falls back to disconnecting the whole plane.
+func (s *Server) revokeDeletedCR(planeType, planeID, namespace, name string) (revoked, closed int, disconnected int) {
+	if name == "" {
+		return 0, 0, s.connMgr.DisconnectAllForPlane(planeType, planeID)
+	}
+	revoked, closed = s.connMgr.RevokeCR(planeType, planeID, fmt.Sprintf("%s/%s", namespace, name))
+	return revoked, closed, 0
 }
 
 // propagatePlaneEvent broadcasts a plane lifecycle event to peer replicas so
@@ -1254,9 +1391,10 @@ func (s *Server) propagatePlaneEvent(ev fabric.PlaneEvent) {
 	s.fabricMesh.BroadcastPlaneEvent(ev)
 }
 
-// fetchCRClientCA fetches the client CA configured for one CR of a plane.
+// fetchCRClientCA fetches the client CA configured for one CR of a plane. The
+// CA is read fresh (not from the CA cache), and only for that CR.
 func (s *Server) fetchCRClientCA(planeType, planeID, namespace, name string) ([]byte, error) {
-	allCRs, err := s.getAllPlaneClientCAs(planeType, planeID)
+	allCRs, err := s.getPlaneClientCAs(planeType, planeID, fmt.Sprintf("%s/%s", namespace, name))
 	if err != nil {
 		return nil, fmt.Errorf("failed to get CRs: %w", err)
 	}
@@ -1417,7 +1555,7 @@ func (s *Server) verifyClientCertificatePerCR(
 		chains, err := clientCert.Verify(opts)
 		if err == nil {
 			validCRs = append(validCRs, crKey)
-			s.logger.Info("certificate valid for CR",
+			s.logger.Debug("certificate valid for CR",
 				"cr", crKey,
 				"clientCN", clientCN,
 				"chainCount", len(chains),
@@ -1458,7 +1596,7 @@ func (s *Server) verifyClientCertificatePerCR(
 		"planeType", planeType,
 		"planeID", planeID,
 		"clientCN", clientCN,
-		"validCRs", validCRs,
+		"validCRCount", len(validCRs),
 		"totalCRs", len(crsClientCAData),
 	)
 

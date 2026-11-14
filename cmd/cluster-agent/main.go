@@ -20,7 +20,7 @@ import (
 const (
 	defaultReconnectDelay    = 5 * time.Second
 	defaultHeartbeatInterval = 30 * time.Second
-	defaultRequestTimeout    = 30 * time.Second
+	defaultRequestTimeout    = 25 * time.Second // below the gateway's 30s tunnel wait, so a slow answer still arrives
 )
 
 func main() {

@@ -32,7 +32,21 @@ type AgentConnection struct {
 	ValidCRs        []string          // List of CRs (namespace/name) this connection is authorized for
 	clientCert      *x509.Certificate // Client certificate for re-validation on CR updates
 	intermediates   *x509.CertPool    // Handshake intermediate CAs, used to chain the client cert on re-validation
-	mu              sync.Mutex
+	mu              sync.Mutex        // guards connection state (ValidCRs, LastSeen)
+	// writeMu serializes socket writes. It is separate from mu so a write
+	// stalled on a slow or dead peer never blocks authorization checks, which
+	// the ConnectionManager makes while holding its own lock - otherwise one
+	// stuck socket would stall request routing for every plane on the pod.
+	writeMu sync.Mutex
+}
+
+// agentWriteTimeout bounds one message write to an agent. A write that
+// cannot complete in this time closes the connection; the agent reconnects.
+const agentWriteTimeout = 15 * time.Second
+
+// writeDeadliner is implemented by *websocket.Conn.
+type writeDeadliner interface {
+	SetWriteDeadline(t time.Time) error
 }
 
 // IsValidForCR checks if this connection is authorized for the specified CR
@@ -217,7 +231,6 @@ func (cm *ConnectionManager) Register(
 		"planeType", planeType,
 		"planeID", planeID,
 		"connectionID", connID,
-		"validCRs", validCRs,
 		"validCRCount", len(validCRs),
 		"connectionsForPlane", totalForPlane,
 		"totalConnections", totalConnections,
@@ -445,39 +458,99 @@ func (cm *ConnectionManager) DisconnectAllForPlane(planeType, planeID string) in
 	return disconnectedCount
 }
 
+// RevokeCR removes one CR's authorization from every connection of a plane,
+// without disconnecting connections that remain authorized for other CRs.
+// Connections left with no authorized CR are closed (they can serve nothing).
+// Returns how many connections lost the CR and how many were closed.
+func (cm *ConnectionManager) RevokeCR(planeType, planeID, crKey string) (revoked int, closed int) {
+	planeIdentifier := fmt.Sprintf("%s/%s", planeType, planeID)
+
+	cm.mu.RLock()
+	conns := make([]*AgentConnection, len(cm.connections[planeIdentifier]))
+	copy(conns, cm.connections[planeIdentifier])
+	cm.mu.RUnlock()
+
+	for _, conn := range conns {
+		if !conn.IsValidForCR(crKey) {
+			continue
+		}
+		conn.RemoveValidCR(crKey)
+		revoked++
+		remaining := conn.GetValidCRs()
+		if len(remaining) == 0 {
+			// The read loop sees the close and unregisters the connection.
+			_ = conn.Close()
+			closed++
+			cm.logger.Info("closing agent connection with no remaining authorized CRs",
+				"planeIdentifier", planeIdentifier,
+				"connectionID", conn.ID,
+				"revokedCR", crKey,
+			)
+			continue
+		}
+		if cm.listener != nil {
+			cm.listener.OnAgentCRsChanged(planeIdentifier, conn.ID, remaining)
+		}
+	}
+
+	cm.mu.Lock()
+	delete(cm.roundRobin, fmt.Sprintf("%s/%s", planeIdentifier, crKey))
+	cm.mu.Unlock()
+
+	cm.logger.Info("revoked CR authorization",
+		"planeIdentifier", planeIdentifier,
+		"cr", crKey,
+		"connectionsRevoked", revoked,
+		"connectionsClosed", closed,
+	)
+	return revoked, closed
+}
+
 // SendHTTPTunnelRequest sends an HTTPTunnelRequest through this connection
 func (ac *AgentConnection) SendHTTPTunnelRequest(req *messaging.HTTPTunnelRequest) error {
-	ac.mu.Lock()
-	defer ac.mu.Unlock()
-
 	data, err := json.Marshal(req)
 	if err != nil {
 		return fmt.Errorf("SendHTTPTunnelRequest: failed to marshal request: %w", err)
 	}
 
-	if err := ac.Conn.WriteMessage(websocket.TextMessage, data); err != nil {
+	if err := ac.write(data); err != nil {
 		return fmt.Errorf("SendHTTPTunnelRequest: failed to send request: %w", err)
 	}
 
 	return nil
 }
 
+// write sends one text message under writeMu and a write deadline. A failed
+// write closes the connection: gorilla makes write errors permanent, and
+// closing ends the read loop so the connection is unregistered promptly.
+func (ac *AgentConnection) write(data []byte) error {
+	ac.writeMu.Lock()
+	defer ac.writeMu.Unlock()
+
+	if wd, ok := ac.Conn.(writeDeadliner); ok {
+		if err := wd.SetWriteDeadline(time.Now().Add(agentWriteTimeout)); err != nil {
+			_ = ac.Conn.Close()
+			return err
+		}
+	}
+	if err := ac.Conn.WriteMessage(websocket.TextMessage, data); err != nil {
+		_ = ac.Conn.Close()
+		return err
+	}
+	return nil
+}
+
 // SendRawMessage sends a pre-marshaled JSON message through this connection.
 func (ac *AgentConnection) SendRawMessage(data []byte) error {
-	ac.mu.Lock()
-	defer ac.mu.Unlock()
-
-	if err := ac.Conn.WriteMessage(websocket.TextMessage, data); err != nil {
+	if err := ac.write(data); err != nil {
 		return fmt.Errorf("SendRawMessage: failed to send message: %w", err)
 	}
 	return nil
 }
 
-// Close closes the agent connection
+// Close closes the agent connection. It takes no lock, so it can unblock a
+// writer stuck on the socket.
 func (ac *AgentConnection) Close() error {
-	ac.mu.Lock()
-	defer ac.mu.Unlock()
-
 	return ac.Conn.Close()
 }
 

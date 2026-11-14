@@ -16,6 +16,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	crcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -100,7 +101,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 
 		// Requeue to refresh agent connection status
-		return ctrl.Result{RequeueAfter: controller.StatusUpdateInterval}, nil
+		return ctrl.Result{RequeueAfter: controller.StatusRequeueAfter()}, nil
 	}
 
 	// Set the observed generation
@@ -146,7 +147,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	r.Recorder.Event(clusterDataPlane, corev1.EventTypeNormal, "ReconcileComplete", fmt.Sprintf("Successfully created %s", clusterDataPlane.Name))
 
 	// Requeue to refresh agent connection status
-	return ctrl.Result{RequeueAfter: controller.StatusUpdateInterval}, nil
+	return ctrl.Result{RequeueAfter: controller.StatusRequeueAfter()}, nil
 }
 
 func (r *Reconciler) shouldIgnoreReconcile(clusterDataPlane *openchoreov1alpha1.ClusterDataPlane) bool {
@@ -268,7 +269,10 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	// Cluster-scoped planes don't watch namespace-scoped resources like Environments
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&openchoreov1alpha1.ClusterDataPlane{}).
+		For(&openchoreov1alpha1.ClusterDataPlane{}, builder.WithPredicates(controller.PlaneSpecChangedPredicate())).
+		WithOptions(crcontroller.Options{
+			MaxConcurrentReconciles: max(mgr.GetControllerOptions().MaxConcurrentReconciles, controller.PlaneStatusWorkers),
+		}).
 		// A removed control plane namespace triggers a sweep of its plane namespaces.
 		Watches(
 			&corev1.Namespace{},
